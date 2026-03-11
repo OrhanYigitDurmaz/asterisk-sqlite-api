@@ -3,7 +3,7 @@ SQLModel ORM models for Asterisk 20 PJSIP Realtime tables.
 
 Each class maps 1:1 to the table names and columns defined in schema.sql.
 Asterisk's Realtime engine queries these tables by exact name (ps_auths,
-ps_aors, ps_endpoints), so __tablename__ must match precisely.
+ps_aors, ps_endpoints, extensions), so __tablename__ must match precisely.
 """
 
 from typing import Optional
@@ -100,6 +100,35 @@ class PsEndpoint(SQLModel, table=True):
     dtmf_mode: str = Field(default="rfc4733", max_length=20)
 
 
+class Extension(SQLModel, table=True):
+    """
+    Asterisk Realtime dialplan row.
+
+    Replaces static ``extensions.conf`` entries.  Asterisk's
+    ``pbx_realtime`` module queries this table at call time by
+    ``(context, exten)``, so new rows are picked up immediately —
+    no ``dialplan reload`` required.
+
+    Each row represents a single dialplan priority (step).  A typical
+    extension needs at least two rows:
+
+        priority 1 → Dial(PJSIP/<ext>,30,tT)
+        priority 2 → Hangup()
+
+    The ``id`` column is an autoincrement surrogate key; the natural
+    key is the UNIQUE constraint on ``(context, exten, priority)``.
+    """
+
+    __tablename__ = "extensions"  # type: ignore[assignment]
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    context: str = Field(default="from-internal", max_length=40)
+    exten: str = Field(max_length=40)
+    priority: int = Field(default=1)
+    app: str = Field(max_length=40)
+    appdata: str = Field(default="", max_length=256)
+
+
 class ProvisionRequest(SQLModel):
     """
     Pydantic request body for the POST /provision/{username} endpoint.
@@ -109,3 +138,13 @@ class ProvisionRequest(SQLModel):
 
     password: str = Field(min_length=8, max_length=80)
     context: str = Field(default="from-internal", max_length=40)
+    ring_timeout: int = Field(
+        default=30,
+        ge=5,
+        le=120,
+        description=(
+            "How many seconds to ring the endpoint before giving up. "
+            "Passed as the second argument to Dial() in the auto-generated "
+            "dialplan row (e.g. Dial(PJSIP/6001,30,tT))."
+        ),
+    )

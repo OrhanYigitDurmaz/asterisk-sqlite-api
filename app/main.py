@@ -1,9 +1,10 @@
 """
 FastAPI provisioning API for Asterisk 20 PJSIP Realtime (SQLite backend).
 
-This micro-service exposes a single endpoint that atomically creates
-the three PJSIP Realtime rows (auth, AOR, endpoint) required for a
-SIP extension to become immediately usable by Asterisk without a reload.
+This micro-service exposes endpoints that atomically create (or remove)
+the PJSIP Realtime rows **and** the Realtime dialplan rows required for
+a SIP extension to become immediately usable by Asterisk — no manual
+config-file editing or ``dialplan reload`` required.
 
 Designed for a minimalist 6-user PBX running on Alpine Linux in Docker.
 """
@@ -15,7 +16,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from sqlmodel import Session, select
 
 from app.database import get_session, init_db
-from app.models import ProvisionRequest, PsAor, PsAuth, PsEndpoint
+from app.models import Extension, ProvisionRequest, PsAor, PsAuth, PsEndpoint
 
 
 # ---------------------------------------------------------------------------
@@ -34,8 +35,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(
     title="Asterisk PJSIP Provisioning API",
-    version="1.0.0",
-    description="Provision SIP extensions into Asterisk 20 Realtime (SQLite).",
+    version="1.1.0",
+    description=(
+        "Provision SIP extensions into Asterisk 20 Realtime (SQLite).  "
+        "Automatically creates PJSIP objects **and** Realtime dialplan "
+        "entries so extensions can call each other without any manual "
+        "configuration."
+    ),
     lifespan=lifespan,
 )
 
@@ -47,6 +53,57 @@ app = FastAPI(
 def health_check() -> dict[str, str]:
     """Liveness probe for Docker / Kubernetes."""
     return {"status": "ok"}
+
+
+# ---------------------------------------------------------------------------
+# Helpers – Realtime dialplan rows
+# ---------------------------------------------------------------------------
+def _create_dialplan_rows(
+    session: Session,
+    username: str,
+    context: str,
+    ring_timeout: int,
+) -> None:
+    """
+    Insert the Realtime dialplan rows that let other extensions reach
+    *username*.
+
+    Generates the equivalent of this static ``extensions.conf`` block::
+
+        [from-internal]
+        exten => 6001,1,Dial(PJSIP/6001,30,tT)
+         same =>      2,Hangup()
+
+    Because Asterisk's ``pbx_realtime`` module queries the ``extensions``
+    table on every call, these rows are picked up immediately — no
+    ``dialplan reload`` needed.
+
+    The ``tT`` Dial options allow both the caller (t) and the callee (T)
+    to initiate an attended transfer via the configured feature code.
+    """
+    dial_row = Extension(
+        context=context,
+        exten=username,
+        priority=1,
+        app="Dial",
+        appdata=f"PJSIP/{username},{ring_timeout},tT",
+    )
+    hangup_row = Extension(
+        context=context,
+        exten=username,
+        priority=2,
+        app="Hangup",
+        appdata="",
+    )
+    session.add(dial_row)
+    session.add(hangup_row)
+
+
+def _delete_dialplan_rows(session: Session, username: str) -> None:
+    """Remove all Realtime dialplan rows for *username* across every context."""
+    rows = session.exec(select(Extension).where(Extension.exten == username)).all()
+    for row in rows:
+        session.delete(row)
 
 
 # ---------------------------------------------------------------------------
@@ -65,13 +122,15 @@ def provision_user(
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     """
-    Atomically create **ps_auths**, **ps_aors**, and **ps_endpoints** rows
-    for *username* so the extension is immediately available to Asterisk's
-    PJSIP Realtime engine.
+    Atomically create **ps_auths**, **ps_aors**, **ps_endpoints**, and
+    **extensions** (dialplan) rows for *username* so the extension is
+    immediately available to Asterisk's PJSIP Realtime engine **and**
+    reachable by other extensions — all without editing config files or
+    running ``dialplan reload``.
 
-    All three rows share the same ``id`` value (the username), which is the
-    convention Asterisk expects: the endpoint's ``auth`` and ``aors``
-    columns reference auth/AOR rows by their ``id``.
+    All three PJSIP rows share the same ``id`` value (the username),
+    which is the convention Asterisk expects: the endpoint's ``auth``
+    and ``aors`` columns reference auth/AOR rows by their ``id``.
 
     ### NAT-traversal defaults
 
@@ -79,6 +138,15 @@ def provision_user(
     ``rewrite_contact=yes``, and ``force_rport=yes`` so that devices
     behind NAT (e.g. AudioCodes MP-114) work out of the box without
     one-way audio or registration issues.
+
+    ### Auto-generated dialplan
+
+    Two Realtime dialplan rows are inserted into the ``extensions``
+    table so that dialling *username* from any extension in the same
+    context will ring this endpoint::
+
+        priority 1 → Dial(PJSIP/<username>,<ring_timeout>,tT)
+        priority 2 → Hangup()
     """
 
     # --- Guard: prevent duplicate provisioning ----------------------------
@@ -123,10 +191,13 @@ def provision_user(
         dtmf_mode="rfc4733",  # out-of-band DTMF via RTP events (most reliable)
     )
 
-    # --- Atomic insert: all three rows in a single transaction ------------
+    # --- 4. Dialplan rows -------------------------------------------------
+    # Insert Realtime dialplan entries so other extensions can dial this
+    # one.  Asterisk picks these up instantly via pbx_realtime.
     session.add(auth)
     session.add(aor)
     session.add(endpoint)
+    _create_dialplan_rows(session, username, body.context, body.ring_timeout)
 
     try:
         session.commit()
@@ -154,10 +225,11 @@ def deprovision_user(
     session: Session = Depends(get_session),
 ) -> dict[str, str]:
     """
-    Remove all three Realtime rows for *username*.
+    Remove all PJSIP Realtime rows **and** dialplan rows for *username*.
 
     Asterisk will stop recognising the extension on its next Realtime
-    lookup (typically within seconds — no ``pjsip reload`` needed).
+    lookup (typically within seconds — no ``pjsip reload`` or
+    ``dialplan reload`` needed).
     """
 
     endpoint = session.exec(select(PsEndpoint).where(PsEndpoint.id == username)).first()
@@ -167,7 +239,7 @@ def deprovision_user(
             detail=f"Extension '{username}' not found.",
         )
 
-    # Delete in reverse dependency order (endpoint → AOR → auth).
+    # Delete in reverse dependency order (endpoint → AOR → auth → dialplan).
     auth = session.exec(select(PsAuth).where(PsAuth.id == username)).first()
     aor = session.exec(select(PsAor).where(PsAor.id == username)).first()
 
@@ -176,6 +248,7 @@ def deprovision_user(
         session.delete(aor)
     if auth is not None:
         session.delete(auth)
+    _delete_dialplan_rows(session, username)
 
     try:
         session.commit()
