@@ -1,0 +1,76 @@
+# ─────────────────────────────────────────────────────────────
+# CI/CD — Build & Publish Docker image to GitHub Container Registry
+# Triggers on every push to the main branch.
+# ─────────────────────────────────────────────────────────────
+
+name: Build & Publish to GHCR
+
+on:
+  push:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  # github.repository returns "owner/repo-name" — used as the image name
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    # Required permissions for GITHUB_TOKEN:
+    #   contents: read  — checkout the repository
+    #   packages: write — push the container image to ghcr.io
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      # ── 1. Checkout source ────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Docker Buildx ───────────────────────────
+      # Buildx is required for advanced features like GHA layer caching.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # ── 3. Authenticate to GHCR ──────────────────────────
+      # Uses the built-in GITHUB_TOKEN — no PAT needed.
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── 4. Extract image metadata (tags + labels) ────────
+      # Tagging strategy:
+      #   • "latest"        — so docker-compose always pulls the newest build
+      #   • "sha-<short>"   — the short commit SHA for pinned rollbacks
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Always tag as "latest" on main branch pushes
+            type=raw,value=latest
+            # Tag with the short git commit SHA (e.g. sha-a1b2c3d)
+            type=sha,prefix=sha-,format=short
+
+      # ── 5. Build and push the image ──────────────────────
+      # Caching mechanism:
+      #   Uses GitHub Actions cache backend (type=gha). Docker layers
+      #   (especially the pip install step) are cached between runs,
+      #   dramatically speeding up builds when only application code
+      #   changes — the requirements.txt layer is served from cache.
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
