@@ -1,14 +1,3 @@
--- ================================================================
--- Asterisk 20 PJSIP Realtime Schema (SQLite3)
---
--- These tables are queried directly by Asterisk's Realtime engine
--- via res_config_sqlite3.  Column names and types MUST match what
--- Asterisk expects — do not rename or remove columns.
---
--- All statements use IF NOT EXISTS so this file is idempotent.
--- ================================================================
-
--- 1. Authentication Table (Passwords)
 CREATE TABLE IF NOT EXISTS ps_auths (
     id VARCHAR(40) NOT NULL PRIMARY KEY,
     auth_type VARCHAR(40) DEFAULT 'userpass',
@@ -19,7 +8,6 @@ CREATE TABLE IF NOT EXISTS ps_auths (
     realm VARCHAR(40)
 );
 
--- 2. AOR Table (Address of Record / Registration)
 CREATE TABLE IF NOT EXISTS ps_aors (
     id VARCHAR(40) NOT NULL PRIMARY KEY,
     max_contacts INTEGER DEFAULT 1,
@@ -31,41 +19,23 @@ CREATE TABLE IF NOT EXISTS ps_aors (
     authenticate_qualify VARCHAR(10) DEFAULT 'no'
 );
 
--- 3. Endpoints Table (The main logic)
 CREATE TABLE IF NOT EXISTS ps_endpoints (
     id VARCHAR(40) NOT NULL PRIMARY KEY,
-    transport VARCHAR(40) DEFAULT 'transport-udp',
+    transport VARCHAR(40) DEFAULT 'transport-ws',
     aors VARCHAR(200),
     auth VARCHAR(200),
     context VARCHAR(40) DEFAULT 'from-internal',
     disallow VARCHAR(200) DEFAULT 'all',
-    allow VARCHAR(200) DEFAULT 'ulaw,alaw',
-    direct_media VARCHAR(10) DEFAULT 'no',
+    allow VARCHAR(200) DEFAULT 'ulaw,alaw,opus',
+    webrtc VARCHAR(10) DEFAULT 'yes',
+    dtmf_mode VARCHAR(20) DEFAULT 'rfc4733',
     rtp_symmetric VARCHAR(10) DEFAULT 'yes',
     force_rport VARCHAR(10) DEFAULT 'yes',
     rewrite_contact VARCHAR(10) DEFAULT 'yes',
-    dtmf_mode VARCHAR(20) DEFAULT 'rfc4733'
+    direct_media VARCHAR(10) DEFAULT 'no',
+    callerid VARCHAR(80)
 );
 
--- 4. Dialplan Extensions Table (Realtime Dialplan)
---
--- This table replaces static extensions.conf entries.  Asterisk's
--- pbx_realtime module queries it at call time, so new rows are
--- picked up immediately — no "dialplan reload" required.
---
--- Asterisk expects these exact column names (see Asterisk wiki:
--- "Realtime Dialplan").  Each row is one dialplan priority:
---
---   context  → dialplan context (e.g. "from-internal")
---   exten    → extension pattern or literal number
---   priority → execution order (1, 2, 3… or labels like "n")
---   app      → Asterisk application to execute (Dial, Answer, etc.)
---   appdata  → arguments passed to the application
---
--- Example rows for extension 6001:
---   ("from-internal", "6001", 1, "Dial",   "PJSIP/6001,30,tT")
---   ("from-internal", "6001", 2, "Hangup", "")
---
 CREATE TABLE IF NOT EXISTS extensions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     context VARCHAR(40) NOT NULL,
@@ -76,7 +46,5 @@ CREATE TABLE IF NOT EXISTS extensions (
     UNIQUE(context, exten, priority)
 );
 
--- Asterisk performs lookups by (context, exten) on every call.
--- This index ensures those queries are fast even as the table grows.
 CREATE INDEX IF NOT EXISTS idx_extensions_context_exten
     ON extensions (context, exten);
